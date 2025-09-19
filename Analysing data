@@ -1,0 +1,54 @@
+Shared circRNA Count Matrix - CIRI2
+
+library(readr)
+library(dplyr)
+
+# Define my sample names
+sample_ids <- paste0("Sample", 1:8)
+
+# Initialize an empty list to store data for each sample
+ciri2_list <- list()
+
+# Loop over each sample
+for (sample in sample_ids) {
+  # Build the file name
+  file_name <- paste0(sample, "_ciri2_output.txt")
+  
+  # Read the file
+  ciri2_data <- read_tsv(file_name, show_col_types = FALSE)
+  
+  # If the full circRNA ID is present:
+  if ("circRNA_ID" %in% colnames(ciri2_data)) {
+    ciri2_data$circ_id <- ciri2_data$circRNA_ID
+  } else {
+    # Otherwise, construct manually
+    ciri2_data$circ_id <- paste0(ciri2_data$chromosome, ":", ciri2_data$circRNA_start, "|", ciri2_data$circRNA_end)
+  }
+  
+  # Save in the list with the sample name
+  ciri2_list[[sample]] <- ciri2_data
+}
+shared_df <- tibble::rownames_to_column(shared_df, var = "circRNA_ID")
+head(shared_df)
+
+View(shared_df)
+
+#create a ggplot HEATMAP of shared circRNAs
+library(ggplot2)
+library(reshape2)
+
+# Convert matrix to long format for ggplot
+shared_long <- melt(as.matrix(shared_df), varnames = c("Sample1", "Sample2"), value.name = "Shared")
+
+# Plot heatmap
+p <- ggplot(shared_long, aes(x = Sample1, y = Sample2, fill = Shared)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Shared circRNAs Between Samples", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+
+#save the ggplot
+ggsave("shared_circRNAs_heatmap.png", plot = p, width = 6, height = 5, dpi = 300)
