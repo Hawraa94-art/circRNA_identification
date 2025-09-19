@@ -1,0 +1,905 @@
+# ---- Setup ----
+# Install once if needed:
+# install.packages(c("tidyverse", "data.table"))
+# BiocManager::install(c("ReactomePA", "clusterProfiler", "org.Hs.eg.db", "enrichplot"))
+
+library(tidyverse)
+library(data.table)
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+# ---- Paths (EDIT THESE) ----
+circRNA_finder_dir <- "Path to your directory"
+ciri2_dir          <- "Path to your directory"
+output_dir         <- "Path to your directory"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# File patterns to read (edit if your files have different extensions)
+PATTERN <- "\\.(txt|tsv|csv|bed)$"
+
+# Column names to try for host gene symbols
+COL_GUESS <- c("host_gene","hostGene","gene","Gene","GeneSymbol","gene_symbol","symbol","SYMBOL","HostGene")
+
+# ---- Helpers ----
+list_files <- function(dir, pattern = PATTERN) {
+  list.files(dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
+}
+
+read_genes_from_files <- function(files, col_guess = COL_GUESS) {
+  genes <- c()
+  for (f in files) {
+    df <- tryCatch(
+      {
+        # Try fast fread; fallback to readr if needed
+        data.table::fread(f, nThread = 2, data.table = FALSE)
+      },
+      error = function(e) {
+        suppressMessages(
+          readr::read_delim(f, delim = ifelse(grepl("\\.csv$", f, ignore.case = TRUE), ",", "\t"), show_col_types = FALSE)
+        )
+      }
+    )
+    # try to find a likely gene column
+    col_found <- intersect(col_guess, names(df))
+    if (length(col_found) == 0) {
+      # heuristic fallback: if BED-like and 4th/5th col often carries name
+      cand <- names(df)[pmin(4, ncol(df))]
+      if (!is.na(cand)) col_found <- cand
+    }
+    if (length(col_found) == 0) {
+      message("Skipping (no gene column found): ", f)
+      next
+    }
+    g <- df[[col_found[1]]] %>% as.character() %>% trimws()
+    genes <- c(genes, g)
+  }
+  genes %>% discard(~is.na(.x) || .x == "") %>% unique()
+}
+
+to_entrez <- function(symbols) {
+  if (length(symbols) == 0) return(character(0))
+  suppressMessages(
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  ) %>% distinct(SYMBOL, .keep_all = TRUE) %>% pull(ENTREZID) %>% unique()
+}
+
+run_reactome <- function(entrez_vec, name, outdir = output_dir, universe = NULL) {
+  if (length(entrez_vec) < 5) {
+    message(" Skipping Reactome for ", name, " (fewer than 5 genes).")
+    return(NULL)
+  }
+  enr <- enrichPathway(
+    gene          = entrez_vec,
+    organism      = "human",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    pAdjustMethod = "BH",
+    universe      = universe,
+    readable      = TRUE
+  )
+  if (is.null(enr) || nrow(as.data.frame(enr)) == 0) {
+    message("No significant pathways for ", name)
+    return(NULL)
+  }
+  
+  # Save table
+  tb <- as.data.frame(enr)
+  write_csv(tb, file.path(outdir, paste0("reactome_", name, ".csv")))
+  
+  # Plots
+  pdf(file.path(outdir, paste0("reactome_dotplot_", name, ".pdf")), width = 8, height = 6)
+  print(dotplot(enr, showCategory = 20) + ggtitle(paste0("Reactome: ", name)))
+  dev.off()
+  
+  pdf(file.path(outdir, paste0("reactome_cnetplot_", name, ".pdf")), width = 10, height = 8)
+  # cnetplot can be heavy; cap categories
+  print(cnetplot(enr, showCategory = 10, foldChange = NULL, circular = FALSE))
+  dev.off()
+  
+  enr
+}
+
+# ---- Load genes from each tool ----
+files_finder <- list_files(circRNA_finder_dir)
+files_ciri2  <- list_files(ciri2_dir)
+
+genes_finder <- read_genes_from_files(files_finder)
+genes_ciri2  <- read_genes_from_files(files_ciri2)
+
+message("circRNA_finder genes: ", length(genes_finder))
+message("CIRI2 genes: ", length(genes_ciri2))
+
+# ---- Build sets ----
+genes_union <- union(genes_finder, genes_ciri2)
+genes_inter <- intersect(genes_finder, genes_ciri2)
+
+# Optional: define a gene universe (background). If you have a curated universe, set it here.
+# By default we use all symbols observed in either tool.
+universe_symbols <- genes_union
+universe_entrez  <- to_entrez(universe_symbols)
+
+to_entrez <- function(ids) {
+  if (length(ids) == 0) return(character(0))
+  suppressMessages(
+    bitr(ids,
+         fromType = "ENSEMBL",
+         toType   = "ENTREZID",
+         OrgDb    = org.Hs.eg.db)
+  ) %>%
+    distinct(ENSEMBL, .keep_all = TRUE) %>%
+    pull(ENTREZID) %>%
+    unique()
+}
+
+# add at the top with your other libraries
+library(AnnotationDbi)
+
+# helper: quick peek at ID patterns (optional, for debugging)
+inspect_ids <- function(ids, n = 12) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[ids != "" & !is.na(ids)]
+  cat("Sample IDs:\n"); print(utils::head(ids, n))
+  cat("\nPattern counts:\n")
+  pats <- c(
+    ENSEMBL_gene = "^ENSG\\d+",
+    ENSEMBL_tx   = "^ENST\\d+",
+    REFSEQ_mRNA  = "^NM_\\d+",
+    REFSEQ_ncRNA = "^NR_\\d+",
+    UNIPROT      = "^[A-NR-Z0-9]{6,10}$",
+    SYMBOL_like  = "^[A-Za-z0-9-_.]{2,}$"
+  )
+  for (nm in names(pats)) {
+    cat(sprintf("  %-12s : %d\n", nm, sum(grepl(pats[[nm]], ids))))
+  }
+}
+
+# drop-in replacement (auto-detect + multi-keytype mapping)
+to_entrez <- function(ids) {
+  if (length(ids) == 0) return(character(0))
+  
+  # flatten lists, split multi-valued cells, trim
+  ids <- unlist(strsplit(as.character(ids), "[,;|]"))
+  ids <- trimws(ids)
+  ids <- ids[ids != "" & !is.na(ids) & ids != "-" & toupper(ids) != "NA"]
+  
+  # strip simple prefixes and version suffixes (e.g., ENSG... .12 or NM_... .1)
+  ids <- sub("^gene:", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.\\d+$", "", ids)
+  
+  # keytypes to try, filtered to those actually present in your OrgDb
+  kt_all <- c("SYMBOL","ALIAS","ENSEMBL","ENSEMBLTRANS",
+              "REFSEQ","REFSEQ_MRNA","REFSEQ_NP","UNIPROT")
+  kt <- intersect(kt_all, keytypes(org.Hs.eg.db))
+  if (length(kt) == 0) {
+    message("No usable keytypes found in org.Hs.eg.db.")
+    return(character(0))
+  }
+  
+  # try each keytype; collect successful mappings
+  res_list <- list()
+  for (k in kt) {
+    df <- tryCatch(
+      AnnotationDbi::select(org.Hs.eg.db,
+                            keys = ids,
+                            keytype = k,
+                            columns = c("ENTREZID","SYMBOL")),
+      error = function(e) NULL
+    )
+    if (!is.null(df) && k %in% names(df)) {
+      df$keytype <- k
+      # keep only rows with an ENTREZID
+      df <- df[!is.na(df$ENTREZID) & df$ENTREZID != "", ]
+      if (nrow(df) > 0) res_list[[k]] <- df
+    }
+  }
+  
+  if (length(res_list) == 0) {
+    message("No mappings found. Run inspect_ids(genes_union) to see formats.")
+    return(character(0))
+  }
+  
+  # bind results and prefer certain sources first
+  suppressWarnings({
+    combined <- dplyr::bind_rows(res_list)
+  })
+  priority <- intersect(c("SYMBOL","ALIAS","ENSEMBL","ENSEMBLTRANS",
+                          "REFSEQ","REFSEQ_MRNA","REFSEQ_NP","UNIPROT"),
+                        unique(combined$keytype))
+  combined$keytype <- factor(combined$keytype, levels = priority)
+  combined <- combined %>%
+    dplyr::arrange(keytype) %>%
+    dplyr::distinct(ENTREZID, .keep_all = TRUE)
+  
+  # small report
+  n_mapped <- length(unique(combined$ENTREZID))
+  n_input  <- length(unique(ids))
+  message(sprintf("Mapped %d / %d unique IDs to ENTREZ (%.1f%%) via %s.",
+                  n_mapped, n_input, 100*n_mapped/n_input,
+                  paste(priority, collapse = " > ")))
+  unique(combined$ENTREZID)
+}
+
+
+# --- FIX inspect_ids() (escape '-' or put it last) ---
+inspect_ids <- function(ids, n = 12) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[ids != "" & !is.na(ids)]
+  cat("Sample IDs:\n"); print(utils::head(ids, n))
+  cat("\nPattern counts:\n")
+  pats <- c(
+    ENSEMBL_gene = "^ENSG\\d+",
+    ENSEMBL_tx   = "^ENST\\d+",
+    REFSEQ_mRNA  = "^NM_\\d+",
+    REFSEQ_ncRNA = "^NR_\\d+",
+    UNIPROT      = "^[A-NR-Z0-9]{6,10}$",  # ok
+    SYMBOL_like  = "^[A-Za-z0-9._-]{2,}$"  # moved '-' to the end
+  )
+  for (nm in names(pats)) {
+    cat(sprintf("  %-12s : %d\n", nm, sum(grepl(pats[[nm]], ids))))
+  }
+}
+
+
+# --- Replace read_genes_from_files() with a smarter extractor ---
+read_genes_from_files <- function(files) {
+  all_genes <- character(0)
+  
+  # name-based priority (case-insensitive)
+  col_priority <- c(
+    "host_gene", "hostgene", "host.gene",
+    "gene_symbol", "genesymbol", "symbol",
+    "gene", "^gene.id$", "gene_id", "gene-id"
+  )
+  
+  for (f in files) {
+    df <- tryCatch(
+      data.table::fread(f, nThread = 2, data.table = FALSE, check.names = FALSE),
+      error = function(e) {
+        suppressMessages(
+          readr::read_delim(
+            f,
+            delim = ifelse(grepl("\\.csv$", f, ignore.case = TRUE), ",", "\t"),
+            show_col_types = FALSE,
+            progress = FALSE
+          )
+        )
+      }
+    )
+    
+    if (!is.data.frame(df) || nrow(df) == 0) {
+      message(" Empty or unreadable: ", f)
+      next
+    }
+    
+    # try to find a good gene column by regex on names
+    nms <- names(df)
+    nms_l <- tolower(nms)
+    
+    # exact/regex matching by priority
+    pick <- character(0)
+    for (pat in col_priority) {
+      hit <- nms[grepl(pat, nms_l, perl = TRUE)]
+      if (length(hit) > 0) { pick <- hit[1]; break }
+    }
+    
+    # common circRNA tool columns to parse if no direct gene column is found
+    circ_cols <- nms[grepl("circ.*id|circ.*rna.*id", nms_l)]
+    
+    candidate <- NULL
+    if (length(pick) > 0) {
+      candidate <- df[[pick]]
+      message("✓ Using gene column '", pick, "' from: ", basename(f))
+    } else if (length(circ_cols) > 0) {
+      # last resort: try to extract gene from circRNA ID strings if they include it
+      x <- as.character(df[[circ_cols[1]]])
+      # heuristics: look for gene after "gene=" or between brackets, or last token non-numeric
+      cand <- sub(".*(?:gene=)([A-Za-z0-9._-]+).*", "\\1", x)               # gene=TP53
+      cand2 <- sub(".*\\(([^)]+)\\).*", "\\1", x)                           # ... (TP53)
+      cand3 <- sub("^.*[|_: ]([A-Za-z][A-Za-z0-9._-]+)$", "\\1", x)         # last token looks like gene
+      # choose the best non-empty
+      candidate <- ifelse(cand != x, cand, ifelse(cand2 != x, cand2, cand3))
+      message(" Parsed candidate genes from circ ID column '", circ_cols[1], "' in: ", basename(f))
+    } else {
+      message("No obvious gene column or circRNA ID to parse in: ", basename(f))
+      next
+    }
+    
+    # clean candidate
+    g <- candidate %>%
+      as.character() %>%
+      trimws() %>%
+      sub("^gene:", "", ., ignore.case = TRUE) %>%
+      sub("\\.\\d+$", "", .)   # strip version suffixes
+    
+    g <- g[g != "" & !is.na(g) & g != "-"]
+    
+    if (length(g) == 0) {
+      message("No usable entries in chosen column for: ", basename(f))
+      next
+    }
+    
+    # If the column is actually numeric indices, skip it:
+    frac_numeric <- mean(grepl("^\\d+$", g))
+    if (frac_numeric > 0.8) {
+      message("Column appears numeric (", round(100*frac_numeric,1), "% digits) — skipping file: ", basename(f))
+      next
+    }
+    
+    all_genes <- c(all_genes, g)
+  }
+  
+  unique(all_genes)
+}
+
+files_finder <- list_files(circRNA_finder_dir)
+files_ciri2  <- list_files(ciri2_dir)
+
+genes_finder <- read_genes_from_files(files_finder)
+genes_ciri2  <- read_genes_from_files(files_ciri2)
+
+message("circRNA_finder genes: ", length(genes_finder))
+message("CIRI2 genes: ", length(genes_ciri2))
+
+genes_union <- union(genes_finder, genes_ciri2)
+genes_inter <- intersect(genes_finder, genes_ciri2)
+
+inspect_ids(genes_union)  # should now show real gene-like tokens
+
+countG_dir <- "/Users/hawraaaljboury/Desktop/OneDrive_1_04-07-2025/countG"
+
+
+read_genes_from_countG <- function(dir) {
+  files <- list.files(dir, pattern = "\\.(txt|tsv|csv)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(files) == 0) { message(" No files in ", dir); return(character(0)) }
+  
+  col_priority <- c(
+    "host_gene", "hostgene", "host.gene",
+    "^gene.?id$", "gene_id", "gene-id", "gene", "symbol", "gene_symbol", "genesymbol", "hgnc"
+  )
+  
+  all_genes <- character(0)
+  
+  for (f in files) {
+    df <- tryCatch(
+      data.table::fread(f, nThread = 2, data.table = FALSE, check.names = FALSE),
+      error = function(e) suppressMessages(
+        readr::read_delim(f,
+                          delim = ifelse(grepl("\\.csv$", f, TRUE), ",", "\t"),
+                          show_col_types = FALSE,
+                          progress = FALSE)
+      )
+    )
+    if (!is.data.frame(df) || nrow(df) == 0) { message("Empty: ", basename(f)); next }
+    
+    nms   <- names(df); nms_l <- tolower(nms)
+    hit   <- character(0)
+    for (pat in col_priority) {
+      idx <- which(grepl(pat, nms_l, perl = TRUE))
+      if (length(idx) > 0) { hit <- nms[idx[1]]; break }
+    }
+    
+    genes <- NULL
+    if (length(hit)) {
+      message("✓ ", basename(f), " — using column '", hit, "'")
+      genes <- df[[hit]]
+    } else {
+      # Try count-matrix layout: first col = gene IDs, other cols numeric
+      if (ncol(df) >= 2) {
+        other <- suppressWarnings(sapply(df[-1], function(x) all(grepl("^\\d*\\.?\\d+$", as.character(x)) | is.na(x))))
+        if (any(other)) {
+          message("✓ ", basename(f), " — count matrix detected; using first column '", names(df)[1], "' as gene IDs")
+          genes <- df[[1]]
+        }
+      }
+    }
+    
+    if (is.null(genes)) { message("No gene-like column in ", basename(f)); next }
+    
+    g <- genes %>%
+      as.character() %>%
+      trimws() %>%
+      sub("^gene:", "", ., ignore.case = TRUE) %>%
+      sub("\\.\\d+$", "", .)           # strip version suffixes
+    
+    g <- g[g != "" & !is.na(g) & g != "-"]
+    # Skip accidental numeric-only columns
+    if (length(g) == 0) { next }
+    if (mean(grepl("^\\d+$", g)) > 0.8) {
+      message("Looks numeric-only — skipping ", basename(f))
+      next
+    }
+    
+    all_genes <- c(all_genes, g)
+  }
+  
+  unique(all_genes)
+}
+
+
+# Existing
+files_ciri2   <- list.files(ciri2,
+                            pattern="\\.(txt|tsv|csv)$", full.names=TRUE, ignore.case=TRUE)
+genes_ciri2   <- read_genes_from_files(files_ciri2)   
+
+# New: circRNA_finder host genes from countG
+genes_finder  <- read_genes_from_countG(countG_dir)
+
+message("circRNA_finder (from countG) genes: ", length(genes_finder))
+message("CIRI2 genes: ", length(genes_ciri2))
+
+# Map to ENTREZ
+entrez_finder <- to_entrez(genes_finder)
+entrez_ciri2  <- to_entrez(genes_ciri2)
+
+# Sets in ENTREZ space
+entrez_union  <- unique(c(entrez_finder, entrez_ciri2))
+entrez_inter  <- intersect(entrez_finder, entrez_ciri2)
+
+# Background = union
+universe_entrez <- entrez_union
+
+# Run Reactome
+enr_finder <- run_reactome(entrez_finder, "circRNA_finder_only",     universe = universe_entrez)
+enr_ciri2  <- run_reactome(entrez_ciri2,  "ciri2_only",              universe = universe_entrez)
+enr_union  <- run_reactome(entrez_union,  "union_both_tools",        universe = universe_entrez)
+enr_inter  <- run_reactome(entrez_inter,  "intersection_both_tools", universe = universe_entrez)
+
+print (enr_union)
+
+length(entrez_finder); length(entrez_ciri2); length(universe_entrez)
+
+
+# read only host genes with non-zero circ counts from countG
+read_circfinder_genes_from_countG <- function(dir) {
+  files <- list.files(dir, pattern="\\.(txt|tsv|csv)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(files) == 0) { message(" No files in ", dir); return(character(0)) }
+  
+  col_priority <- c(
+    "^gene.?id$", "gene_id", "gene-id", "symbol", "gene_symbol", "genesymbol",
+    "host_gene", "hostgene", "host.gene", "hgnc"
+  )
+  
+  all_genes <- character(0)
+  
+  for (f in files) {
+    df <- tryCatch(
+      data.table::fread(f, nThread=2, data.table=FALSE, check.names=FALSE),
+      error=function(e) suppressMessages(
+        readr::read_delim(f,
+                          delim = ifelse(grepl("\\.csv$", f, TRUE), ",", "\t"),
+                          show_col_types = FALSE,
+                          progress = FALSE)
+      )
+    )
+    if (!is.data.frame(df) || nrow(df) == 0) { message("⚠️ Empty: ", basename(f)); next }
+    
+    nms <- names(df); nms_l <- tolower(nms)
+    
+    # find gene id column
+    gene_col <- NULL
+    for (pat in col_priority) {
+      hit <- which(grepl(pat, nms_l, perl=TRUE))
+      if (length(hit) > 0) { gene_col <- nms[hit[1]]; break }
+    }
+    if (is.null(gene_col)) {
+      # fallback: assume first column is gene IDs if others are numeric
+      num_ok <- suppressWarnings(sapply(df[-1], function(x) all(grepl("^\\d*\\.?\\d+$", as.character(x)) | is.na(x))))
+      if (length(num_ok) && any(num_ok)) gene_col <- nms[1]
+    }
+    if (is.null(gene_col)) { message("No gene column in ", basename(f)); next }
+    
+    # numeric columns treated as counts
+    num_cols <- suppressWarnings(sapply(df, function(x) all(grepl("^\\d*\\.?\\d+$", as.character(x)) | is.na(x))))
+    num_cols[match(gene_col, nms)] <- FALSE  # exclude the gene column
+    count_mat <- as.matrix(df[, num_cols, drop=FALSE])
+    
+    if (ncol(count_mat) == 0) {
+      message(" No numeric count columns in ", basename(f), " — skipping")
+      next
+    }
+    
+    # keep genes with any non-zero counts across samples
+    keep <- rowSums(suppressWarnings(apply(count_mat, 2, function(x) as.numeric(x)))) > 0
+    g <- df[[gene_col]][keep]
+    
+    g <- g %>%
+      as.character() %>%
+      trimws() %>%
+      sub("^gene:", "", ., ignore.case=TRUE) %>%
+      sub("\\.\\d+$", "", .)    # strip version suffixes like .12
+    
+    g <- g[g != "" & !is.na(g) & g != "-"]
+    if (length(g) == 0) next
+    
+    # avoid numeric-only artifacts
+    if (mean(grepl("^\\d+$", g)) > 0.8) {
+      message("Gene column looks numeric in ", basename(f), " — skipped")
+      next
+    }
+    
+    message("✓ ", basename(f), ": kept ", sum(keep), " host genes with non-zero circ counts")
+    all_genes <- c(all_genes, g)
+  }
+  
+  unique(all_genes)
+}
+
+countG_dir <- "/Users/hawraaaljboury/Desktop/OneDrive_1_04-07-2025/countG"
+
+
+  # detect numeric (count) columns
+  is_numcol <- sapply(df, function(x) {
+    xch <- as.character(x)
+    all(grepl("^\\d*\\.?\\d+$", xch) | is.na(xch))
+  })
+  is_numcol[match(gene_col, nms)] <- FALSE
+  if (!any(is_numcol)) return(character(0))
+  
+  mat <- as.matrix(df[, is_numcol, drop=FALSE])
+  # crude expression filter: >0 in at least min_samples columns
+  mat_num <- suppressWarnings(apply(mat, 2, function(x) as.numeric(as.character(x))))
+  if (!is.matrix(mat_num)) mat_num <- matrix(mat_num, ncol=1)
+  keep <- rowSums(mat_num > 0, na.rm=TRUE) >= min_samples
+  
+  # clean gene IDs
+  genes <- as.character(df[[gene_col]][keep])
+  genes <- trimws(genes)
+  genes <- sub("^gene:", "", genes, ignore.case=TRUE)
+  genes <- sub("\\.\\d+$", "", genes)  # strip version suffixes
+  genes <- genes[genes != "" & !is.na(genes) & genes != "-"]
+  
+  # avoid numeric-only artifact
+  if (length(genes) == 0) return(character(0))
+  if (mean(grepl("^\\d+$", genes)) > 0.8) return(character(0))
+  
+  unique(to_entrez(genes))
+}
+
+
+universe_entrez_expr <- get_expressed_entrez_from_countG(countG_dir)
+length(universe_entrez_expr)
+enr_finder <- ReactomePA::enrichPathway(
+  gene=entrez_finder, organism="human",
+  universe=universe_entrez_expr,
+  pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.2,
+  minGSSize=5, maxGSSize=2000, readable=TRUE
+)
+
+# library(magrittr)
+genes <- df[[gene_col]][keep] |>
+  as.character() |>
+  trimws() |>
+  (\(x) sub("^gene:", "", x, ignore.case=TRUE))() |>
+  (\(x) sub("\\.\\d+$", "", x))()
+
+# View top terms 
+df_finder <- as.data.frame(enr_finder)
+if (nrow(df_finder) > 0) {
+  print(utils::head(dplyr::arrange(df_finder, p.adjust), 15))
+  readr::write_csv(df_finder, file.path(output_dir, "reactome_circfinder_exprBG.csv"))
+  
+  pdf(file.path(output_dir, "reactome_dotplot_circfinder_exprBG.pdf"), width=8, height=6)
+  print(enrichplot::dotplot(enr_finder, showCategory = 20) + ggtitle("Reactome • circRNA_finder (expr BG)"))
+  dev.off()
+  
+  pdf(file.path(output_dir, "reactome_cnetplot_circfinder_exprBG.pdf"), width=10, height=8)
+  print(enrichplot::cnetplot(enr_finder, showCategory = 10, circular = FALSE))
+  dev.off()
+} else {
+  message("No significant pathways for circRNA_finder with expressed-gene background.")
+}
+
+suppressPackageStartupMessages({
+  library(ReactomePA)
+  library(AnnotationDbi)
+  library(reactome.db)      # <- add this
+  library(dplyr)
+  library(enrichplot)
+  library(readr)
+})
+
+# 0) IDs are characters
+entrez_finder <- unique(as.character(entrez_finder))
+universe_entrez_expr <- unique(as.character(universe_entrez_expr))
+
+# 1) Intersect with universe
+entrez_finder_bg <- intersect(entrez_finder, universe_entrez_expr)
+
+# 2)  how many of these are in Reactome
+reactome_genes <- AnnotationDbi::keys(reactome.db, keytype = "ENTREZID")
+n_in_reactome  <- length(intersect(entrez_finder_bg, reactome_genes))
+n_finder_bg    <- length(entrez_finder_bg)
+n_universe     <- length(universe_entrez_expr)
+
+cat("Finder in BG:", n_finder_bg,
+    "| Finder in Reactome:", n_in_reactome,
+    "| Universe:", n_universe, "\n")
+
+# 3) If too few genes are in Reactome, stop gracefully
+if (n_in_reactome < 5) {
+  message("Not enough circ_finder genes map to Reactome (", n_in_reactome, "). 
+Consider:
+ - re-checking ID mapping (ensure ENTREZ IDs),
+ - relaxing filters on countG (increase expressed background),
+ - or trying GSEA if you have a ranked list.")
+  enr_finder <- NULL
+} else {
+  # 4) Safe enrichment (wrapped)
+  enr_finder <- tryCatch(
+    ReactomePA::enrichPathway(
+      gene=entrez_finder_bg, organism="human",
+      universe=universe_entrez_expr,
+      pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.2,
+      minGSSize=5, maxGSSize=2000, readable=TRUE
+    ),
+    error=function(e) { message("enrichPathway error: ", e$message); NULL }
+  )
+}
+
+# 5) Only handle results if they exist and have rows
+if (!is.null(enr_finder)) {
+  df_finder <- as.data.frame(enr_finder)
+  if (is.data.frame(df_finder) && nrow(df_finder) > 0) {
+    df_finder <- arrange(df_finder, p.adjust)
+    print(head(df_finder, 15))
+    readr::write_csv(df_finder, file.path(output_dir, "reactome_circfinder_exprBG.csv"))
+    
+    pdf(file.path(output_dir, "reactome_dotplot_circfinder_exprBG.pdf"), width=8, height=6)
+    print(enrichplot::dotplot(enr_finder, showCategory=20) + ggtitle("Reactome • circRNA_finder (expr BG)"))
+    dev.off()
+    
+    pdf(file.path(output_dir, "reactome_cnetplot_circfinder_exprBG.pdf"), width=10, height=8)
+    print(enrichplot::cnetplot(enr_finder, showCategory=10, circular=FALSE))
+    dev.off()
+  } else {
+    message("No significant pathways for circRNA_finder with this background.")
+  }
+}
+
+suppressPackageStartupMessages({ library(reactome.db); library(dplyr) })
+
+entrez_finder        <- unique(as.character(entrez_finder))
+universe_entrez_expr <- unique(as.character(universe_entrez_expr))
+reactome_genes       <- AnnotationDbi::keys(reactome.db, keytype="ENTREZID")
+
+entrez_finder_bg <- intersect(entrez_finder, universe_entrez_expr)
+cat("Finder n=", length(entrez_finder),
+    " | Finder∩BG n=", length(entrez_finder_bg),
+    " | Finder∩BG∩Reactome n=", length(intersect(entrez_finder_bg, reactome_genes)),
+    " | Universe n=", length(universe_entrez_expr), "\n")
+
+safe_enrich <- function(genes, tag, universe) {
+  genes <- unique(as.character(genes))
+  genes_bg <- intersect(genes, universe)
+  if (length(genes_bg) < 5) { message("Skipping ", tag, " (<5 genes in background)"); return(NULL) }
+  out <- tryCatch(
+    ReactomePA::enrichPathway(
+      gene=genes_bg, organism="human", universe=universe,
+      pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.2,
+      minGSSize=5, maxGSSize=2000, readable=TRUE
+    ),
+    error=function(e) { message("enrichPathway(", tag, "): ", e$message); NULL }
+  )
+  if (!is.null(out) && nrow(as.data.frame(out)) > 0) {
+    readr::write_csv(as.data.frame(out),
+                     file.path(output_dir, paste0("reactome_", gsub(" ", "_", tag), "_exprBG.csv")))
+    pdf(file.path(output_dir, paste0("reactome_dotplot_", gsub(" ", "_", tag), "_exprBG.pdf")), 8, 6)
+    print(enrichplot::dotplot(out, showCategory=20) + ggtitle(paste("Reactome •", tag)))
+    dev.off()
+    pdf(file.path(output_dir, paste0("reactome_cnetplot_", gsub(" ", "_", tag), "_exprBG.pdf")), 10, 8)
+    print(enrichplot::cnetplot(out, showCategory=10, circular=FALSE))
+    dev.off()
+  } else {
+    message("No significant pathways for ", tag)
+  }
+  out
+}
+
+# Ensure CIRI2 is mapped
+entrez_ciri2 <- unique(to_entrez(genes_ciri2))
+
+# Build sets in ENTREZ space
+entrez_union <- unique(c(entrez_finder, entrez_ciri2))
+entrez_inter <- intersect(entrez_finder, entrez_ciri2)
+
+# Run
+enr_ciri2  <- safe_enrich(entrez_ciri2,  "CIRI2",              universe_entrez_expr)
+enr_union  <- safe_enrich(entrez_union,  "Union (both tools)", universe_entrez_expr)
+enr_inter  <- safe_enrich(entrez_inter,  "Intersection",       universe_entrez_expr)
+
+# Also export unfiltered (exploratory) tables to see what's "just missing"
+explore_unfiltered <- function(genes, tag, universe) {
+  genes_bg <- intersect(unique(as.character(genes)), universe)
+  if (length(genes_bg) < 5) return(invisible(NULL))
+  ep <- ReactomePA::enrichPathway(gene=genes_bg, organism="human", universe=universe,
+                                  pAdjustMethod="BH", pvalueCutoff=1, qvalueCutoff=1,
+                                  minGSSize=5, maxGSSize=2000, readable=TRUE)
+  readr::write_csv(dplyr::arrange(as.data.frame(ep), p.adjust),
+                   file.path(output_dir, paste0("reactome_", gsub(" ","_",tag), "_unfiltered_exprBG.csv")))
+}
+
+explore_unfiltered(entrez_finder, "circ_finder", universe_entrez_expr)
+explore_unfiltered(entrez_ciri2,  "ciri2",       universe_entrez_expr)
+explore_unfiltered(entrez_union,  "union_both",  universe_entrez_expr)
+explore_unfiltered(entrez_inter,  "intersection",universe_entrez_expr)
+
+suppressPackageStartupMessages({ library(reactome.db); library(dplyr) })
+
+reactome_genes <- AnnotationDbi::keys(reactome.db, keytype="ENTREZID")
+
+size_report <- function(tag, genes, universe) {
+  genes <- unique(as.character(genes))
+  bg    <- unique(as.character(universe))
+  g_bg  <- intersect(genes, bg)
+  g_re  <- intersect(g_bg, reactome_genes)
+  cat(sprintf("%-14s  genes=%5d | genes∩BG=%5d | ∩Reactome=%5d | BG=%5d\n",
+              tag, length(genes), length(g_bg), length(g_re), length(bg)))
+}
+
+size_report("Finder",      entrez_finder, universe_entrez_expr)
+size_report("CIRI2",       entrez_ciri2,  universe_entrez_expr)
+size_report("Union",       entrez_union,  universe_entrez_expr)
+size_report("Intersection",entrez_inter,  universe_entrez_expr)
+
+explore_enrich <- function(genes, tag, universe) {
+  g_bg <- intersect(unique(as.character(genes)), unique(as.character(universe)))
+  if (length(g_bg) < 3) { message("Too few genes for ", tag); return(invisible(NULL)) }
+  ep <- ReactomePA::enrichPathway(
+    gene=g_bg, organism="human", universe=universe,
+    pAdjustMethod="BH", pvalueCutoff=1, qvalueCutoff=1,
+    minGSSize=3, maxGSSize=3000, readable=TRUE
+  )
+  out <- dplyr::arrange(as.data.frame(ep), p.adjust)
+  readr::write_csv(out, file.path(output_dir, paste0("reactome_", gsub(" ","_",tag), "_exploratory.csv")))
+  utils::head(out, 20)
+}
+
+explore_enrich(entrez_finder, "circ_finder", universe_entrez_expr)
+explore_enrich(entrez_ciri2,  "ciri2",       universe_entrez_expr)
+explore_enrich(entrez_union,  "union",       universe_entrez_expr)
+explore_enrich(entrez_inter,  "intersection",universe_entrez_expr)
+
+suppressPackageStartupMessages({
+  library(ReactomePA)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(dplyr)
+  library(readr)
+})
+
+# 1) Build the gene-set list (ensure overlap with background; drop tiny sets)
+gene_sets <- list(
+  circ_finder   = intersect(unique(as.character(entrez_finder)),   unique(as.character(universe_entrez_expr))),
+  ciri2         = intersect(unique(as.character(entrez_ciri2)),    unique(as.character(universe_entrez_expr))),
+  union         = intersect(unique(as.character(entrez_union)),     unique(as.character(universe_entrez_expr))),
+  intersection  = intersect(unique(as.character(entrez_inter)),     unique(as.character(universe_entrez_expr)))
+)
+
+# Drop any set with < 5 testable genes (ORA can’t run)
+gene_sets <- gene_sets[sapply(gene_sets, length) >= 5]
+if (length(gene_sets) == 0) stop("All sets have <5 testable genes in the background.")
+
+# 2) Compare across sets with Reactome (exploratory cutoffs)
+cc <- compareCluster(
+  geneCluster    = gene_sets,
+  fun            = "enrichPathway",
+  organism       = "human",
+  universe       = unique(as.character(universe_entrez_expr)),
+  pAdjustMethod  = "BH",
+  pvalueCutoff   = 1,      # exploratory
+  qvalueCutoff   = 1,      # exploratory
+  minGSSize      = 3,
+  maxGSSize      = 3000,
+  readable       = TRUE
+)
+
+# 3) Save full table, then pick top categories per set for plotting
+df_cc <- as.data.frame(cc) %>% arrange(Cluster, p.adjust)
+readr::write_csv(df_cc, file.path(output_dir, "reactome_compareCluster_exploratory.csv"))
+
+# pick top 15 per set for a tidy plot
+top_cc <- df_cc %>%
+  group_by(Cluster) %>%
+  slice_min(p.adjust, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+readr::write_csv(top_cc, file.path(output_dir, "reactome_compareCluster_top15.csv"))
+
+# 4) Plot all sets together (faceted by set)
+pdf(file.path(output_dir, "reactome_compareCluster_dotplot_exploratory.pdf"), width = 12, height = 7)
+print(
+  dotplot(cc, showCategory = 15) +
+    ggtitle("Reactome (exploratory) • circ_finder vs CIRI2 vs Union vs Intersection")
+)
+dev.off()
+
+# 5) (Optional) Heatmap-style overview of -log10(FDR) across sets
+suppressPackageStartupMessages(library(tidyr))
+mat_cc <- df_cc %>%
+  mutate(minusLog10FDR = -log10(p.adjust)) %>%
+  select(Cluster, Description, minusLog10FDR) %>%
+  pivot_wider(names_from = Cluster, values_from = minusLog10FDR, values_fill = 0)
+
+readr::write_csv(mat_cc, file.path(output_dir, "reactome_compareCluster_matrix.csv"))
+
+# If you want a quick heatmap:
+# BiocManager::install("pheatmap")  # once
+# library(pheatmap)
+# pdf(file.path(output_dir, "reactome_compareCluster_heatmap.pdf"), width=10, height=12)
+# pheatmap(as.matrix(column_to_rownames(mat_cc, "Description")), cluster_rows = TRUE, cluster_cols = TRUE)
+# dev.off()
+
+suppressPackageStartupMessages({ library(clusterProfiler); library(org.Hs.eg.db); library(enrichplot) })
+
+safe_enrich_library <- function(fn, genes, tag, universe, ...) {
+  g_bg <- intersect(unique(as.character(genes)), unique(as.character(universe)))
+  if (length(g_bg) < 5) { message("Skipping ", tag, " (<5 genes)"); return(NULL) }
+  res <- fn(gene = g_bg, universe = universe, ...)
+  df  <- as.data.frame(res)
+  if (nrow(df) > 0) {
+    readr::write_csv(df, file.path(output_dir, paste0(tag, ".csv")))
+    pdf(file.path(output_dir, paste0("dotplot_", tag, ".pdf")), 8, 6)
+    print(enrichplot::dotplot(res, showCategory=20) + ggtitle(tag))
+    dev.off()
+  } else message("No sig terms for ", tag)
+  invisible(res)
+}
+
+# GO Biological Process
+enr_go_union <- safe_enrich_library(
+  clusterProfiler::enrichGO, entrez_union, "GO_BP_union_exprBG", universe_entrez_expr,
+  OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable = TRUE
+)
+
+# KEGG
+enr_kegg_union <- safe_enrich_library(
+  clusterProfiler::enrichKEGG, entrez_union, "KEGG_union_exprBG", universe_entrez_expr,
+  organism = "hsa", keyType = "kegg", pAdjustMethod = "BH",
+  pvalueCutoff = 0.05, qvalueCutoff = 0.2
+)
+
+# (repeat for intersection / each tool if desired)
+# install.packages("msigdbr")  # if needed
+suppressPackageStartupMessages({
+  library(msigdbr); library(clusterProfiler); library(enrichplot)
+  library(dplyr); library(readr); library(tidyr)
+})
+
+# Build KEGG TERM2GENE/TERM2NAME from MSigDB
+msig_kegg <- msigdbr(species="Homo sapiens", category="C2", subcategory="CP:KEGG")
+T2G_kegg  <- msig_kegg %>% dplyr::select(gs_name, entrez_gene)
+T2N_kegg  <- msig_kegg %>% dplyr::select(gs_name, gs_name) %>% distinct()
+colnames(T2N_kegg) <- c("term","name")
+
+# Your sets (ensure filtered to universe)
+gene_sets <- list(
+  circ_finder  = intersect(entrez_finder,  universe_entrez_expr),
+  ciri2        = intersect(entrez_ciri2,   universe_entrez_expr),
+  union        = intersect(entrez_union,   universe_entrez_expr),
+  intersection = intersect(entrez_inter,   universe_entrez_expr)
+)
+gene_sets <- gene_sets[sapply(gene_sets, length) >= 5]   # drop too-small sets
+
+# Compare across sets using custom KEGG gene sets (ORA)
+cc_kegg <- compareCluster(
+  geneCluster   = gene_sets,
+  fun           = "enricher",
+  TERM2GENE     = T2G_kegg,
+  TERM2NAME     = T2N_kegg,
+  universe      = universe_entrez_expr,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.25,
+  minGSSize     = 5,
+  maxGSSize     = 2000
+)
+
+df_kegg <- as.data.frame(cc_kegg) %>% arrange(Cluster, p.adjust)
+readr::write_csv(df_kegg, file.path(output_dir, "compareCluster_MSigDB_KEGG.csv"))
+
+pdf(file.path(output_dir, "compareCluster_MSigDB_KEGG_dotplot.pdf"), width=12, height=7)
+print(dotplot(cc_kegg, showCategory=15) + ggtitle("MSigDB KEGG • circ_finder vs CIRI2 vs Union vs Intersection"))
+dev.off()
